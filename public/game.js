@@ -1562,28 +1562,25 @@ function renderBoard() {
   } else $('board').innerHTML = `<table>${head}${rows([...room.players])}</table>`;
 }
 
-// markers above tanks (enemies only when in line of sight)
-let losT = 0; const _mkTop = new THREE.Vector3();
+// markers above tanks — allies always; enemies ONLY while the crosshair is on them (realistic mode)
+const _aimDir = new THREE.Vector3(); let aimedId = null, aimedT = 0;
 function updateMarkers(dt) {
-  losT -= dt;
-  const doLos = losT <= 0; if (doLos) losT = 0.2;
+  // ray straight through the crosshair
+  camera.getWorldDirection(_aimDir);
+  _o[0] = camera.position.x; _o[1] = camera.position.y; _o[2] = camera.position.z;
+  _d[0] = _aimDir.x; _d[1] = _aimDir.y; _d[2] = _aimDir.z;
+  const ah = inGame ? castRay(_o, _d, 600, myId, { step: 2 }) : null;
+  if (ah && ah.kind === 'tank' && ah.tank.alive && isEnemy(ah.tank.id)) { aimedId = ah.tank.id; aimedT = performance.now(); }
+  else if (performance.now() - aimedT > 120) aimedId = null;
   const w = innerWidth, h = innerHeight;
   for (const t of tanks.values()) {
     const mk = t.marker;
     if (!inGame || t.id === myId || !t.alive || !t.vis.g.visible) { mk.style.display = 'none'; continue; }
     const enemy = isEnemy(t.id);
+    if (enemy && t.id !== aimedId) { mk.style.display = 'none'; continue; }
     const top = _mkTop.copy(t.vis.g.position); top.y += 4.2;
-    if (doLos) {
-      if (!enemy) t.losVisible = true;
-      else {
-        const dx = top.x - camera.position.x, dy = top.y - 1.5 - camera.position.y, dz = top.z - camera.position.z, d = Math.hypot(dx, dy, dz);
-        _o[0] = camera.position.x; _o[1] = camera.position.y; _o[2] = camera.position.z; _d[0] = dx / d; _d[1] = dy / d; _d[2] = dz / d;
-        const hit = d < 420 ? castRay(_o, _d, d - 2, myId, { noTanks: true, step: 4 }) : true;
-        t.losVisible = !hit;
-      }
-    }
     _v2.copy(top).project(camera);
-    if (_v2.z > 1 || !t.losVisible) { mk.style.display = 'none'; continue; }
+    if (_v2.z > 1) { mk.style.display = 'none'; continue; }
     const p = room.players.find(q => q.id === t.id);
     mk.style.display = 'block';
     mk.className = 'mk ' + (enemy ? 'en' : 'al');
@@ -1592,6 +1589,7 @@ function updateMarkers(dt) {
     mk.querySelector('i').style.width = (p ? p.hp : 0) + '%';
   }
 }
+const _mkTop = new THREE.Vector3();
 
 // ── minimap ──
 const mm = $('minimap'), mctx = mm.getContext('2d');
@@ -1631,7 +1629,7 @@ function drawMinimap() {
   for (const t of tanks.values()) {
     if (!t.vis.g.visible) continue;
     const enemy = isEnemy(t.id), isMe = t.id === myId;
-    if (enemy && !t.losVisible && t.alive) continue;
+    if (enemy) continue; // enemies never shown on the minimap
     const [x, y] = P(t.x, t.z);
     mctx.save(); mctx.translate(x, y); mctx.rotate(-t.yaw + Math.PI);
     mctx.fillStyle = !t.alive ? '#555' : isMe ? '#fff' : enemy ? '#ff5a46' : '#8fe060';
