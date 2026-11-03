@@ -9,10 +9,11 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' }, pingInterval: 5000, pingTimeout: 8000 });
+const io = new Server(server, { cors: { origin: '*' }, pingInterval: 10000, pingTimeout: 30000 });
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/vendor/three', express.static(path.join(__dirname, 'node_modules/three/build')));
+app.use('/vendor/three-addons', express.static(path.join(__dirname, 'node_modules/three/examples/jsm')));
 
 const PORT = process.env.PORT || 3000;
 
