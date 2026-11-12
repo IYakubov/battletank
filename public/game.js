@@ -3,6 +3,8 @@
 // ═══════════════════════════════════════════════════════
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 
 const socket = io({ transports: ['websocket', 'polling'] });
 const $ = id => document.getElementById(id);
@@ -128,7 +130,7 @@ const audio = (() => {
     if (unlocked) return; unlocked = true;
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     master = ctx.createGain(); master.connect(ctx.destination);
-    ['shoot', 'hit', 'ricochet', 'energy', 'victory'].forEach(load);
+    ['shoot', 'hit', 'ricochet', 'energy', 'victory', 'tank_shot_1', 'tank_shot_2', 'tank_shot_3', 'explosion'].forEach(load);
     // engine rumble
     engOsc = ctx.createOscillator(); engOsc.type = 'sawtooth'; engOsc.frequency.value = 38;
     engOsc2 = ctx.createOscillator(); engOsc2.type = 'square'; engOsc2.frequency.value = 19;
@@ -659,7 +661,89 @@ function partBuilder() {
 const BOX = (w, h, d) => new THREE.BoxGeometry(w, h, d);
 const CYL = (r1, r2, h, s = 10) => new THREE.CylinderGeometry(r1, r2, h, s);
 
+// ═══════════ TANK MODEL (textured .glb) ═══════════
+// "Fictional Cold War Tank" by æck (Sketchfab); loaded once, cloned per tank
+let tankTemplate = null;
+const tankEnv = (() => {   // sky reflections for the tank's metal and paint
+  const es = new THREE.Scene();
+  es.add(new THREE.Mesh(new THREE.SphereGeometry(100, 32, 16), new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    vertexShader: 'varying vec3 vp; void main(){ vp=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }',
+    fragmentShader: `varying vec3 vp; void main(){ vec3 d=normalize(vp); float h=d.y;
+      vec3 sky=mix(vec3(0.76,0.79,0.78), vec3(0.42,0.54,0.62), clamp(h*1.6,0.,1.));
+      vec3 gnd=mix(vec3(0.40,0.38,0.30), vec3(0.22,0.22,0.17), clamp(-h*2.5,0.,1.));
+      vec3 c=mix(gnd, sky, smoothstep(-0.03,0.03,h));
+      float s=max(dot(d, normalize(vec3(0.55,0.75,0.35))),0.); c+=vec3(1.0,0.9,0.75)*(pow(s,500.)*25.+pow(s,30.)*0.7);
+      gl_FragColor=vec4(c,1.); }`
+  })));
+  const pm = new THREE.PMREMGenerator(renderer);
+  const tex = pm.fromScene(es, 0.03).texture; pm.dispose(); return tex;
+})();
+const tankModelReady = new Promise(res => {
+  const l = new GLTFLoader(); l.setMeshoptDecoder(MeshoptDecoder);
+  l.load('models/tank.glb', gl => { tankTemplate = gl.scene; tankTemplate.updateMatrixWorld(true); res(true); for (const t of tanks.values()) swapTankVis(t); },
+    undefined, e => { console.warn('tank model not loaded, using the built-in one', e); res(false); });
+});
+const _tb = new THREE.Box3(), _tv = new THREE.Vector3();
+function buildTankModel(color) {
+  const S = 0.9;
+  const g = new THREE.Group();
+  const model = tankTemplate.clone(true);
+  model.scale.setScalar(S); model.position.set(0, 0.27 * S, 0.4);
+  g.add(model);
+  // own copies of the materials so team tint and wreck darkening stay per tank
+  const copies = new Map(), mats = [];
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    o.castShadow = true; o.receiveShadow = true;
+    let m = copies.get(o.material);
+    if (!m) { m = o.material.clone(); m.envMap = tankEnv; m.envMapIntensity = 0.9; copies.set(o.material, m); if (m.name !== 'Optics') mats.push(m); }
+    o.material = m;
+  });
+  g.updateMatrixWorld(true);
+  const nodes = re => { const out = []; model.traverse(o => { if (re.test(o.name) && !o.isMesh) out.push(o); }); return out; };
+  // a pivot group placed at a point (in g space) that adopts a node, keeping where it is
+  const pivot = (parent, at, node) => { const p = new THREE.Group(); parent.add(p); parent.updateMatrixWorld(true); p.position.copy(parent.worldToLocal(at.clone())); p.updateMatrixWorld(true); if (node) p.attach(node); return p; };
+  const wpos = n => n.getWorldPosition(new THREE.Vector3());
+  const turretNode = nodes(/^Turret_low/)[0], mantle = nodes(/^Mantle/)[0], cannon = nodes(/^Cannon_low/)[0];
+  const turret = pivot(g, wpos(turretNode), turretNode);
+  for (const h of nodes(/^Hatch/)) turret.attach(h);
+  const gun = pivot(turret, wpos(mantle), mantle);
+  _tb.setFromObject(cannon);
+  const tip = new THREE.Object3D(); gun.add(tip);
+  tip.position.copy(gun.worldToLocal(new THREE.Vector3((_tb.min.x + _tb.max.x) / 2, (_tb.min.y + _tb.max.y) / 2, _tb.max.z)));
+  // running gear: each wheel mesh holds the left and right wheel; spin it about its centre
+  const wheels = [];
+  for (const w of nodes(/^(Roadwheel|Sprocket|Upper_?Wheel)/)) {
+    _tb.setFromObject(w);
+    const c = _tb.getCenter(new THREE.Vector3());
+    const p = pivot(g, c, w);
+    p.userData.r = Math.max(0.15, (_tb.max.y - _tb.min.y) / 2); p.userData.both = true;
+    wheels.push(p);
+  }
+  g.updateMatrixWorld(true);
+  const vis = { g, turret, gun, barrel: cannon, tip, mats, color: new THREE.Color(color), wheels, tracks: null, ty: turret.position.y, recoil: cannon, recoilZ: cannon.position.z, recoilK: 0.5 / (S * 0.91), model: true };
+  vis.tint = col => {
+    const c = new THREE.Color(col); const mx = Math.max(c.r, c.g, c.b, 0.001); c.multiplyScalar(1 / mx);
+    for (const m of mats) m.color.setRGB(1, 1, 1).lerp(c, 0.42);
+  };
+  vis.tint(color);
+  return vis;
+}
+function swapTankVis(t) {
+  if (t.vis.model || !tankTemplate) return;
+  const was = t.vis.g.visible;
+  scene.remove(t.vis.g);
+  t.vis = buildTankModel(t.vis.color.getHex());
+  scene.add(t.vis.g); t.vis.g.visible = was;
+  if (!t.alive) for (const m of t.vis.mats) m.color.multiplyScalar(0.28);
+  orientTank(t, 1);
+}
 function buildTank(color, num = '000') {
+  if (tankTemplate) return buildTankModel(color);
+  return buildTankProc(color, num);
+}
+function buildTankProc(color, num = '000') {
   const g = new THREE.Group();
   const hullMat = new THREE.MeshStandardMaterial({ color, map: camoTex, roughness: .82, metalness: .12, flatShading: true });
   const detMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(color).multiplyScalar(0.72), roughness: .85, metalness: .15, flatShading: true });
@@ -773,7 +857,7 @@ function buildTank(color, num = '000') {
     n.position.set(sx * 1.335, 0.46, -0.35); n.rotation.y = sx * Math.PI / 2 + (sx > 0 ? 0 : 0); n.rotation.y = sx > 0 ? Math.PI / 2 : -Math.PI / 2;
     turret.add(n);
   }
-  return { g, turret, gun, barrel, tip, mats, color: new THREE.Color(color), wheels, tracks: [trackTexL, trackTexR] };
+  return { g, turret, gun, barrel, tip, mats, color: new THREE.Color(color), wheels, tracks: [trackTexL, trackTexR], ty: 1.62 };
 }
 
 // ═══════════ TANK ENTITIES ═══════════
@@ -820,13 +904,14 @@ function syncTanks() {
 }
 function setTankColor(t, col) {
   t.vis.color.set(col);
+  if (t.vis.tint) return t.vis.tint(col);
   t.vis.mats[0].color.set(col);
   t.vis.mats[1].color.set(col).multiplyScalar(0.72);
 }
 function placeTank(t, s) {
   t.x = t.tx = s.x; t.z = t.tz = s.z; t.yaw = t.tyaw = s.yaw; t.tYaw = t.ttYaw = 0; t.gun = t.tgun = 0; t.speed = 0;
   t.alive = true; t.hp = MAX_HP; t.pop = 0; t.popVel = 0;
-  t.vis.turret.position.y = 1.62; t.vis.turret.rotation.set(0, 0, 0);
+  t.vis.turret.position.y = t.vis.ty; t.vis.turret.rotation.set(0, 0, 0);
   const p = room.players.find(q => q.id === t.id);
   setTankColor(t, colorFor(p || { id: t.id, team: 0 }));
   t.vis.g.visible = true;
@@ -847,8 +932,8 @@ function orientTank(t, k) {
     const ds = dx * Math.sin(t.yaw) + dz * Math.cos(t.yaw);
     if (Math.abs(ds) < 4 && (Math.abs(ds) > 1e-5 || Math.abs(dyw) > 1e-5)) {
       const sR = ds + dyw * 1.62, sL = ds - dyw * 1.62;   // sR: local -x side, sL: local +x side
-      for (const w of t.vis.wheels) w.rotation.x += (w.position.x < 0 ? sR : sL) / w.userData.r;
-      t.vis.tracks[0].offset.y -= sR * 1.64; t.vis.tracks[1].offset.y -= sL * 1.64;
+      for (const w of t.vis.wheels) w.rotation.x += (w.userData.both ? ds : w.position.x < 0 ? sR : sL) / w.userData.r;
+      if (t.vis.tracks) { t.vis.tracks[0].offset.y -= sR * 1.64; t.vis.tracks[1].offset.y -= sL * 1.64; }
       if (t.alive) {
         t.markD = (t.markD || 0) + Math.abs(ds) + Math.abs(dyw) * 1.6;
         if (t.markD > 0.8) {
@@ -876,11 +961,12 @@ function orientTank(t, k) {
   g.position.set(t.x, Math.max(hF, hB, hR, hL, H(t.x, t.z)) - 0.05, t.z);
   t.vis.turret.rotation.y = t.tYaw;
   t.vis.gun.rotation.x = -t.gun;
-  t.vis.gun.position.z = 1.35 - t.recoil * 0.55;
+  if (t.vis.recoil) t.vis.recoil.position.z = t.vis.recoilZ - t.recoil * t.vis.recoilK;
+  else t.vis.gun.position.z = 1.35 - t.recoil * 0.55;
   if (!t.alive && t.popVel !== 0) {
     t.pop += t.popVel * (1 / 60); t.popVel -= 20 / 60;
     if (t.pop <= 0) { t.pop = 0; t.popVel = 0; }
-    t.vis.turret.position.y = 1.62 + t.pop;
+    t.vis.turret.position.y = t.vis.ty + t.pop;
     t.vis.turret.rotation.z = t.pop * 0.12; t.vis.turret.rotation.x = t.pop * 0.05;
   }
   g.updateMatrixWorld(true);
@@ -1313,7 +1399,7 @@ function fire(t) {
   spawnShell(tip, vel, myId, true);
   socket.emit('fire', { o: [+tip.x.toFixed(2), +tip.y.toFixed(2), +tip.z.toFixed(2)], v: [+vel.x.toFixed(2), +vel.y.toFixed(2), +vel.z.toFixed(2)] });
   muzzleFx(t, tip, dir);
-  audio.play('shoot', 1.3);
+  audio.play('tank_shot_' + (1 + Math.floor(Math.random() * 3)), 1.1);
   disp += 0.035; shake = Math.max(shake, 0.35);
 }
 function muzzleFx(t, tip, dir) {
@@ -1350,7 +1436,7 @@ socket.on('fire', (id, f) => {
   const o = new THREE.Vector3(...f.o), v = new THREE.Vector3(...f.v);
   spawnShell(o, v, id, false);
   muzzleFx(t, o, v.clone().normalize());
-  audio.at('shoot', o, 1.4);
+  audio.at('tank_shot_' + (1 + Math.floor(Math.random() * 3)), o, 1.2);
 });
 
 // ═══════════ CAMERA & AIM ═══════════
@@ -1718,8 +1804,8 @@ socket.on('kill', d => {
     wreckTank(tk);
     const pos = tk.vis.g.position.clone();
     particles.explosion(pos);
-    audio.at('hit', pos, 1, 0.7);
-    setTimeout(() => audio.at('hit', pos, 0.6, 0.55), 160);
+    audio.at('explosion', pos, 1.5);
+    audio.at('hit', pos, 0.6, 0.6);
     if (d.target === myId) { shake = 1; audio.engineOff(); sniper = false; specId = d.by !== myId ? d.by : null; }
   }
   feed(`<b style="color:${nameCol(d.by)}">${nameOf(d.by)}</b><span class="x">✕</span><b style="color:${nameCol(d.target)}">${nameOf(d.target)}</b>`);
