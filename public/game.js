@@ -685,6 +685,78 @@ const tankModelReady = new Promise(res => {
     undefined, e => { console.warn('tank model not loaded, using the built-in one', e); res(false); });
 });
 const _tb = new THREE.Box3(), _tv = new THREE.Vector3();
+// ── moving tank tracks ──
+// the tracks are chains of separate links; a vertex shader slides every link along the loop around the wheels.
+// Per vertex we store where it sits along the loop (s) and how far outside the loop's line it is (d).
+const TRK_K = 128;
+function trackRig(mesh) {
+  const geo = mesh.geometry;
+  if (!geo.userData.trk) {
+    // which geometry axes are the tank's forward and up
+    const e = mesh.matrixWorld.elements, col = i => [e[i * 4], e[i * 4 + 1], e[i * 4 + 2]];
+    const cols = [col(0), col(1), col(2)];
+    const axU = [0, 1, 2].reduce((a, b) => Math.abs(cols[b][1]) > Math.abs(cols[a][1]) ? b : a, 0);
+    const axF = [0, 1, 2].filter(i => i !== axU).reduce((a, b) => Math.abs(cols[b][2]) > Math.abs(cols[a][2]) ? b : a);
+    const pos = geo.attributes.position, n = pos.count, comp = ['getX', 'getY', 'getZ'];
+    const P = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) { P[i * 2] = pos[comp[axF]](i); P[i * 2 + 1] = pos[comp[axU]](i); }
+    // convex hull of the side profile (monotone chain), counter-clockwise
+    const idx = Array.from({ length: n }, (_, i) => i).sort((a, b) => P[a * 2] - P[b * 2] || P[a * 2 + 1] - P[b * 2 + 1]);
+    const cross = (o, a, b) => (P[a * 2] - P[o * 2]) * (P[b * 2 + 1] - P[o * 2 + 1]) - (P[a * 2 + 1] - P[o * 2 + 1]) * (P[b * 2] - P[o * 2]);
+    const lo = [], up = [];
+    for (const i of idx) { while (lo.length > 1 && cross(lo[lo.length - 2], lo[lo.length - 1], i) <= 0) lo.pop(); lo.push(i); }
+    for (let k = idx.length - 1; k >= 0; k--) { const i = idx[k]; while (up.length > 1 && cross(up[up.length - 2], up[up.length - 1], i) <= 0) up.pop(); up.push(i); }
+    const hull = lo.slice(0, -1).concat(up.slice(0, -1)).map(i => [P[i * 2], P[i * 2 + 1]]);
+    // resample the loop evenly by length
+    const segL = hull.map((p, i) => { const q = hull[(i + 1) % hull.length]; return Math.hypot(q[0] - p[0], q[1] - p[1]); });
+    const L = segL.reduce((a, b) => a + b, 0);
+    const path = new Float32Array(TRK_K * 2);
+    for (let k = 0, j = 0, acc = 0; k < TRK_K; k++) {
+      const want = k / TRK_K * L;
+      while (acc + segL[j] < want) { acc += segL[j]; j = (j + 1) % hull.length; }
+      const t = (want - acc) / (segL[j] || 1), p = hull[j], q = hull[(j + 1) % hull.length];
+      path[k * 2] = p[0] + (q[0] - p[0]) * t; path[k * 2 + 1] = p[1] + (q[1] - p[1]) * t;
+    }
+    // each vertex: nearest point on the loop → (s, d)
+    const trk = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const x = P[i * 2], y = P[i * 2 + 1]; let best = 1e18, bs = 0, bd = 0;
+      for (let k = 0; k < TRK_K; k++) {
+        const ax = path[k * 2], ay = path[k * 2 + 1], bx = path[((k + 1) % TRK_K) * 2], by = path[((k + 1) % TRK_K) * 2 + 1];
+        const dx = bx - ax, dy = by - ay, ll = dx * dx + dy * dy || 1e-9;
+        const u = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / ll));
+        const px = ax + dx * u, py = ay + dy * u, dd = (x - px) ** 2 + (y - py) ** 2;
+        if (dd < best) { best = dd; bs = (k + u) / TRK_K * L; const sl = Math.sqrt(ll); bd = ((x - px) * dy - (y - py) * dx) / sl; }
+      }
+      trk[i * 2] = bs; trk[i * 2 + 1] = bd;
+    }
+    geo.setAttribute('aTrk', new THREE.BufferAttribute(trk, 2));
+    // which way to slide so the top run moves forward when the tank drives forward
+    let top = 0; for (let k = 1; k < TRK_K; k++) if (path[k * 2 + 1] * Math.sign(cols[axU][1]) > path[top * 2 + 1] * Math.sign(cols[axU][1])) top = k;
+    const tdir = path[((top + 1) % TRK_K) * 2] - path[top * 2];
+    const unit = Math.hypot(...cols[axF]);                       // world metres per geometry unit along forward
+    geo.userData.trk = { path, L, axF, axU, sign: Math.sign(tdir * cols[axF][2]) || 1, unit };
+  }
+  const T = geo.userData.trk, A = 'xyz';
+  const uOff = { value: 0 };
+  const mat = mesh.material.clone(); mat.userData = Object.assign({}, mesh.material.userData);
+  mat.onBeforeCompile = sh => {
+    sh.uniforms.uTrkOff = uOff; sh.uniforms.uTrkLen = { value: T.L };
+    sh.uniforms.uTrkP = { value: Array.from({ length: TRK_K }, (_, k) => new THREE.Vector2(T.path[k * 2], T.path[k * 2 + 1])) };
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', `#include <common>
+attribute vec2 aTrk; uniform float uTrkOff; uniform float uTrkLen; uniform vec2 uTrkP[${TRK_K}];`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+{ float s = mod(aTrk.x + uTrkOff, uTrkLen); float f = s / uTrkLen * ${TRK_K}.0;
+  int i0 = int(floor(f)); if (i0 >= ${TRK_K}) i0 = 0; int i1 = i0 + 1; if (i1 >= ${TRK_K}) i1 = 0;
+  vec2 p0 = uTrkP[i0], p1 = uTrkP[i1]; vec2 tt = p1 - p0; float tl = length(tt); tt = tl > 1e-6 ? tt / tl : vec2(1.0, 0.0);
+  vec2 q = mix(p0, p1, fract(f)) + vec2(tt.y, -tt.x) * aTrk.y;
+  transformed.${A[T.axF]} = q.x; transformed.${A[T.axU]} = q.y; }`);
+  };
+  mat.customProgramCacheKey = () => 'trk' + T.L.toFixed(4);
+  mesh.material = mat;
+  return { mat, uOff, k: T.sign / T.unit, L: T.L };
+}
+
 function buildTankModel(color) {
   const S = 0.9;
   const g = new THREE.Group();
@@ -721,8 +793,11 @@ function buildTankModel(color) {
     p.userData.r = Math.max(0.15, (_tb.max.y - _tb.min.y) / 2); p.userData.both = true;
     wheels.push(p);
   }
+  // tracks: the links slide around the loop as the tank drives
+  const trk = [];
+  for (const tn of nodes(/^(Track_low|Link_low)/)) tn.traverse(o => { if (o.isMesh) { try { const r = trackRig(o); mats.push(r.mat); trk.push(r); } catch (e) { console.warn('track rig', e); } } });
   g.updateMatrixWorld(true);
-  const vis = { g, turret, gun, barrel: cannon, tip, mats, color: new THREE.Color(color), wheels, tracks: null, ty: turret.position.y, recoil: cannon, recoilZ: cannon.position.z, recoilK: 0.5 / (S * 0.91), model: true };
+  const vis = { g, turret, gun, barrel: cannon, tip, mats, color: new THREE.Color(color), wheels, trk, tracks: null, ty: turret.position.y, recoil: cannon, recoilZ: cannon.position.z, recoilK: 0.5 / (S * 0.91), model: true };
   vis.tint = col => {
     const c = new THREE.Color(col); const mx = Math.max(c.r, c.g, c.b, 0.001); c.multiplyScalar(1 / mx);
     for (const m of mats) m.color.setRGB(1, 1, 1).lerp(c, 0.42);
@@ -934,6 +1009,7 @@ function orientTank(t, k) {
       const sR = ds + dyw * 1.62, sL = ds - dyw * 1.62;   // sR: local -x side, sL: local +x side
       for (const w of t.vis.wheels) w.rotation.x += (w.userData.both ? ds : w.position.x < 0 ? sR : sL) / w.userData.r;
       if (t.vis.tracks) { t.vis.tracks[0].offset.y -= sR * 1.64; t.vis.tracks[1].offset.y -= sL * 1.64; }
+      if (t.vis.trk) { t.trkD = (t.trkD || 0) + ds; for (const r of t.vis.trk) r.uOff.value = (t.trkD * r.k) % r.L; }
       if (t.alive) {
         t.markD = (t.markD || 0) + Math.abs(ds) + Math.abs(dyw) * 1.6;
         if (t.markD > 0.8) {
